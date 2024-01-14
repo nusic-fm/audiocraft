@@ -27,6 +27,7 @@ from ..modules.conditioners import (
 from ..modules.codebooks_patterns import CodebooksPatternProvider
 from ..modules.activations import get_activation_fn
 
+import pickle
 
 logger = logging.getLogger(__name__)
 ConditionTensors = tp.Dict[str, ConditionType]
@@ -440,22 +441,10 @@ class LMModel(StreamingModule):
         # We also support doing two different passes, in particular to ensure that
         # the padding structure is exactly the same between train and test.
         # With a batch size of 1, this can be slower though.
-        cfg_conditions: CFGConditions
-        two_step_cfg = self.two_step_cfg if two_step_cfg is None else two_step_cfg
-        if conditions:
-            null_conditions = ClassifierFreeGuidanceDropout(p=1.0)(conditions)
-            if two_step_cfg:
-                cfg_conditions = (
-                    self.condition_provider(self.condition_provider.tokenize(conditions)),
-                    self.condition_provider(self.condition_provider.tokenize(null_conditions)),
-                )
-            else:
-                conditions = conditions + null_conditions
-                tokenized = self.condition_provider.tokenize(conditions)
-                cfg_conditions = self.condition_provider(tokenized)
-        else:
-            cfg_conditions = {}
-
+        cfg_conditions = self.encode_conditions(
+            conditions,
+            two_step_cfg=two_step_cfg)
+        
         if prompt is None:
             assert num_samples > 0
             prompt = torch.zeros((num_samples, self.num_codebooks, 0), dtype=torch.long, device=device)
@@ -531,3 +520,34 @@ class LMModel(StreamingModule):
         # ensure the returned codes are all valid
         assert (out_codes >= 0).all() and (out_codes <= self.card).all()
         return out_codes
+    
+    def encode_conditions(self, conditions: tp.List[ConditioningAttributes],
+                        two_step_cfg: tp.Optional[bool] = None) -> CFGConditions:
+        """
+        Encode conditions for the generation process and optionally save the encoded conditions.
+
+        Args:
+            conditions (list of ConditioningAttributes): Conditions used for generation (text/melody).
+            two_step_cfg (bool, optional): Whether to perform classifier-free guidance with two steps generation.
+            save_path (str, optional): Path to save the encoded conditions. If None, conditions are not saved.
+
+        Returns:
+            CFGConditions: Tokenized and processed conditions for generation.
+        """
+        cfg_conditions: CFGConditions
+        two_step_cfg = self.two_step_cfg if two_step_cfg is None else two_step_cfg
+        if conditions:
+            null_conditions = ClassifierFreeGuidanceDropout(p=1.0)(conditions)
+            if two_step_cfg:
+                cfg_conditions = (
+                    self.condition_provider(self.condition_provider.tokenize(conditions)),
+                    self.condition_provider(self.condition_provider.tokenize(null_conditions)),
+                )
+            else:
+                conditions = conditions + null_conditions
+                tokenized = self.condition_provider.tokenize(conditions)
+                cfg_conditions = self.condition_provider(tokenized)
+        else:
+            cfg_conditions = {}
+
+        return cfg_conditions
