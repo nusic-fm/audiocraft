@@ -524,7 +524,7 @@ class LMModel(StreamingModule):
     def encode_conditions(self, conditions: tp.List[ConditioningAttributes],
                         two_step_cfg: tp.Optional[bool] = None) -> CFGConditions:
         """
-        Encode conditions for the generation process and optionally save the encoded conditions.
+        Encode conditions for the generation process and optionally save them.
 
         Args:
             conditions (list of ConditioningAttributes): Conditions used for generation (text/melody).

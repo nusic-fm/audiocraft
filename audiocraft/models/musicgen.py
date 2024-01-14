@@ -429,7 +429,7 @@ class MusicGen:
     def encode_with_chroma(self, descriptions: tp.List[str], melody_wavs: MelodyType,
                         melody_sample_rate: int, save_path: tp.Optional[str] = None) -> CFGConditions:
         """
-        Encode conditions with chroma (text and melody) for audio generation, including chunk processing.
+        Encode text and melody conditioning.
 
         Args:
             descriptions (list of str): A list of strings used as text conditioning.
