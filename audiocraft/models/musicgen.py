@@ -24,6 +24,7 @@ from ..modules.conditioners import ConditioningAttributes, WavCondition
 from ..utils.autocast import TorchAutocast
 
 import pickle
+import pickle
 
 
 MelodyList = tp.List[tp.Optional[torch.Tensor]]
@@ -427,7 +428,7 @@ class MusicGen:
         return gen_audio
     
     def encode_with_chroma(self, descriptions: tp.List[str], melody_wavs: MelodyType,
-                        melody_sample_rate: int, save_path: tp.Optional[str] = None) -> CFGConditions:
+                        melody_sample_rate: int, save_path: tp.Optional[str] = None) -> tp.Tuple[CFGConditions, tp.List[ConditioningAttributes]]:
         """
         Encode text and melody conditioning.
 
@@ -439,6 +440,7 @@ class MusicGen:
 
         Returns:
             CFGConditions: Encoded conditions for generation.
+            tp.List[ConditioningAttributes]: List of attributes for generation.
         """
         # Convert and prepare melody_wavs
         if isinstance(melody_wavs, torch.Tensor):
@@ -461,15 +463,18 @@ class MusicGen:
         assert prompt_tokens is None
 
         # Encoding conditions
-        encoded_conditions = self._encode_conditions(attributes, prompt_tokens)
-        # Optionally save the encoded conditions
+        encoded_conditions = self._encode_conditions(attributes, prompt_tokens, progress=True)
+        # Optionally save the encoded conditions and attributes
         if save_path:
-            with open(f"{save_path}.pkl", 'wb') as f:
+            with open(f"{save_path}_encoded.pkl", 'wb') as f:
                 pickle.dump(encoded_conditions, f)
-            with open(f"{save_path}.txt", 'w') as f:
+            with open(f"{save_path}_encoded.txt", 'w') as f:
                 f.write(str(encoded_conditions) + "\n")
-        # print("encode_with_chroma: ", encoded_conditions)
-        return encoded_conditions
+            with open(f"{save_path}_attributes.pkl", 'wb') as f:
+                pickle.dump(attributes, f)
+            with open(f"{save_path}_attributes.txt", 'w') as f:
+                f.write(str(attributes) + "\n")
+        return encoded_conditions, attributes
         
     def _encode_conditions(self, attributes: tp.List[ConditioningAttributes],
                         prompt_tokens: tp.Optional[torch.Tensor],
@@ -556,6 +561,139 @@ class MusicGen:
                 current_enc_offset += stride_tokens
 
             encoded_conditions = torch.cat(all_tokens, dim=-1)
-        # print("_encode_conditions: ", encoded_conditions)
         return encoded_conditions  
-                        
+
+    def load_encoded_conditions(self, path: str) -> tp.List[CFGConditions]:
+        """
+        Load encoded conditions from a file.
+
+        Args:
+            path (str): Path to the encoded conditions file.
+        Returns:
+            List of encoded conditions for generation.
+        """
+        if not path.endswith(".pkl"):
+            path += ".pkl"
+        with open(path, 'rb') as f:
+            encoded_conditions = pickle.load(f)
+        return encoded_conditions
+    
+    def load_attributes(self, path: str) -> tp.List[ConditioningAttributes]:
+        """
+        Load attributes from a file.
+
+        Args:
+            path (str): Path to the attributes file.
+        Returns:
+            List of attributes for generation.
+        """
+        if not path.endswith(".pkl"):
+            path += ".pkl"
+        with open(path, 'rb') as f:
+            attributes = pickle.load(f)
+        return attributes
+    
+    def generate_with_encoded_conditions(self, encoded_conditions: CFGConditions, attributes: tp.List[ConditioningAttributes],
+                                        progress: bool = False,
+                                        return_tokens: bool = False) -> tp.Union[torch.Tensor,
+                                                                                    tp.Tuple[torch.Tensor, torch.Tensor]]:
+
+        """Generate samples conditioned on pre-encoded text and melody.
+
+        Args:
+            encoded_conditions (CFGConditions): Encoded conditions for generation.
+            attributes (list of ConditioningAttributes): Conditions used for generation (text/melody).
+            progress (bool, optional): Flag to display progress of the generation process. Defaults to False.
+        """
+        tokens = self._generate_tokens_from_encoded(encoded_conditions, attributes, progress)
+        if return_tokens:
+            return self.generate_audio(tokens), tokens
+        return self.generate_audio(tokens)
+    
+    def _generate_tokens_from_encoded(self, encoded_conditions: CFGConditions, attributes: tp.List[ConditioningAttributes], progress: bool = False) -> torch.Tensor:
+        """Generate discrete audio tokens given encoded conditions.
+
+        Args:
+            encoded_conditions (CFGConditions): Encoded conditions for generation.
+            attributes (list of ConditioningAttributes): Conditions used for generation (text/melody).
+            progress (bool, optional): Flag to display progress of the generation process. Defaults to False.
+        Returns:
+            torch.Tensor: Generated audio, of shape [B, C, T], T is defined by the generation params.
+        """
+        total_gen_len = int(self.duration * self.frame_rate)
+        max_prompt_len = int(min(self.duration, self.max_duration) * self.frame_rate)
+        current_gen_offset: int = 0
+
+        def _progress_callback(generated_tokens: int, tokens_to_generate: int):
+            generated_tokens += current_gen_offset
+            if self._progress_callback is not None:
+                # Note that total_gen_len might be quite wrong depending on the
+                # codebook pattern used, but with delay it is almost accurate.
+                self._progress_callback(generated_tokens, total_gen_len)
+            else:
+                print(f'{generated_tokens: 6d} / {total_gen_len: 6d}', end='\r')
+
+        prompt_tokens = None
+
+        callback = None
+        if progress:
+            callback = _progress_callback
+
+        if self.duration <= self.max_duration:
+            if not isinstance(encoded_conditions, dict):
+                encoded_conditions = encoded_conditions[0]
+            # generate by sampling from LM, simple case.
+            with self.autocast:
+                gen_tokens = self.lm.generate_from_encoded(
+                        prompt=prompt_tokens, encoded_conditions=encoded_conditions, conditions=attributes,
+                        callback=callback, max_gen_len=total_gen_len,
+                        **self.generation_params)
+                
+        else:
+            # now this gets a bit messier, we need to handle prompts,
+            # melody conditioning etc.
+            ref_wavs = [attr.wav['self_wav'] for attr in attributes]
+            all_tokens = []
+            if prompt_tokens is None:
+                prompt_length = 0
+            else:
+                all_tokens.append(prompt_tokens)
+                prompt_length = prompt_tokens.shape[-1]
+
+            stride_tokens = int(self.frame_rate * self.extend_stride)
+
+            while current_gen_offset + prompt_length < total_gen_len:
+                time_offset = current_gen_offset / self.frame_rate
+                chunk_duration = min(self.duration - time_offset, self.max_duration)
+                max_gen_len = int(chunk_duration * self.frame_rate)
+                for encoded, attr, ref_wav in zip(encoded_conditions, attributes, ref_wavs):
+                    wav_length = ref_wav.length.item()
+                    if wav_length == 0:
+                        continue
+                    # We will extend the wav periodically if it not long enough.
+                    # we have to do it here rather than in conditioners.py as otherwise
+                    # we wouldn't have the full wav.
+                    initial_position = int(time_offset * self.sample_rate)
+                    wav_target_length = int(self.max_duration * self.sample_rate)
+                    positions = torch.arange(initial_position,
+                                             initial_position + wav_target_length, device=self.device)
+                    attr.wav['self_wav'] = WavCondition(
+                        ref_wav[0][..., positions % wav_length],
+                        torch.full_like(ref_wav[1], wav_target_length),
+                        [self.sample_rate] * ref_wav[0].size(0),
+                        [None], [0.])
+                with self.autocast:
+                    gen_tokens = self.lm.generate_from_encoded(
+                        prompt=prompt_tokens, encoded_conditions=encoded, conditions=attr,
+                        callback=callback, max_gen_len=max_gen_len,
+                        **self.generation_params)
+                if prompt_tokens is None:
+                    all_tokens.append(gen_tokens)
+                else:
+                    all_tokens.append(gen_tokens[:, :, prompt_tokens.shape[-1]:])
+                prompt_tokens = gen_tokens[:, :, stride_tokens:]
+                prompt_length = prompt_tokens.shape[-1]
+                current_gen_offset += stride_tokens
+
+            gen_tokens = torch.cat(all_tokens, dim=-1)
+        return gen_tokens
